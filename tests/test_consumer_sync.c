@@ -96,6 +96,8 @@ static pid_t blocked_dequeue(int fd, unsigned type, int pipefd[2])
 		struct sigaction sa = { .sa_handler = ignored_signal };
 		struct v4l2_buffer b;
 		int result;
+		/* fork does not inherit the parent's alarm deadline. */
+		alarm(5);
 		close(pipefd[0]);
 		sigemptyset(&sa.sa_mask);
 		CHECK(sigaction(SIGUSR1, &sa, NULL) == 0);
