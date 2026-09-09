@@ -342,6 +342,22 @@ struct v4l2l_buffer {
 	struct dma_buf *import_dbuf;
 };
 
+enum v4l2l_sync_state {
+	V4L2L_SYNC_IDLE,
+	V4L2L_SYNC_PUBLISHED,
+	V4L2L_SYNC_DELIVERED,
+	V4L2L_SYNC_RELEASED,
+	V4L2L_SYNC_CANCELLED,
+	V4L2L_SYNC_RETIRED,
+};
+
+struct v4l2l_sync_buffer {
+	enum v4l2l_sync_state state;
+	bool capture_queued;
+	u64 order;
+	int fd;
+};
+
 struct v4l2_loopback_device {
 	struct v4l2_device v4l2_dev;
 	struct v4l2_ctrl_handler ctrl_handler;
@@ -386,6 +402,14 @@ struct v4l2_loopback_device {
 	s64 write_position; /* sequence number of last 'displayed' buffer plus
 			     * one */
 
+	/* Consumer-coupled queues and bindings, protected by image_mutex. */
+	bool consumer_sync;
+	bool bindings_sealed;
+	bool producer_stopped;
+	unsigned long sync_change;
+	u64 sync_order;
+	struct v4l2l_sync_buffer sync_buffers[MAX_BUFFERS];
+
 	/* synchronization between openers */
 	atomic_t open_count;
 	struct mutex image_mutex; /* mutex for allocating image(s) and
@@ -427,6 +451,8 @@ struct v4l2_loopback_opener {
 	s64 read_position; /* sequence number of the next 'captured' frame */
 	unsigned int reread_count;
 	enum v4l2l_io_method io_method;
+	u32 memory;
+	unsigned long sync_stream_epoch;
 
 	struct v4l2_fh fh;
 };
@@ -1376,6 +1402,11 @@ static int v4l2loopback_set_ctrl(struct v4l2_loopback_device *dev, u32 id,
 				 s64 val)
 {
 	int result = 0;
+	/* These modes synthesize/copy frames without consumer ownership. */
+	if (READ_ONCE(dev->consumer_sync) &&
+	    ((val && (id == CID_SUSTAIN_FRAMERATE || id == CID_TIMEOUT)) ||
+	     id == CID_TIMEOUT_IMAGE_IO))
+		return -EBUSY;
 	switch (id) {
 	case CID_KEEP_FORMAT:
 		if (val < 0 || val > 1)
@@ -1656,6 +1687,300 @@ exit_prepare_queue_unlock:
 /* forward declaration */
 static int do_streamoff(struct file *file, void *fh, enum v4l2_buf_type type);
 static void release_import_dbufs_locked(struct v4l2_loopback_device *dev);
+
+/* All sync helpers except the ioctl entry points hold image_mutex. */
+static void sync_changed(struct v4l2_loopback_device *dev)
+{
+	WRITE_ONCE(dev->sync_change, dev->sync_change + 1);
+	wake_up_all(&dev->read_event);
+}
+
+static bool sync_bound(struct v4l2_loopback_device *dev)
+{
+	u32 i;
+
+	if (!dev->used_buffer_count)
+		return false;
+	for (i = 0; i < dev->used_buffer_count; i++)
+		if (!dev->buffers[i].import_dbuf)
+			return false;
+	return true;
+}
+
+static long vidioc_default(struct file *file, void *fh, bool valid_prio,
+			   unsigned int cmd, void *arg)
+{
+	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
+	struct v4l2_loopback_opener *opener = v4l2l_f_to_opener(file, fh);
+	struct v4l2loopback_bind_dmabuf *bind = arg;
+	struct dma_buf *db;
+	int ret = 0;
+
+	if (cmd != V4L2LOOPBACK_SET_CONSUMER_SYNC &&
+	    cmd != V4L2LOOPBACK_BIND_DMABUF)
+		return -ENOTTY;
+	mutex_lock(&dev->image_mutex);
+	if (opener->format_token != V4L2L_TOKEN_OUTPUT ||
+	    !(dev->format_tokens & V4L2L_TOKEN_CAPTURE) ||
+	    opener->stream_token || dev->bindings_sealed) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (cmd == V4L2LOOPBACK_SET_CONSUMER_SYNC) {
+		u32 enable = *(__u32 *)arg;
+
+		if (enable > 1) {
+			ret = -EINVAL;
+			goto out;
+		}
+		if (opener->buffer_count || dev->sustain_framerate ||
+		    dev->timeout_jiffies || dev->timeout_image_io ||
+		    opener->io_method == V4L2L_IO_FILE ||
+		    !(dev->format_tokens & V4L2L_TOKEN_TIMEOUT)) {
+			ret = -EBUSY;
+			goto out;
+		}
+		dev->consumer_sync = enable;
+		dev->producer_stopped = false;
+		dev->sync_order = 0;
+		memset(dev->sync_buffers, 0, sizeof(dev->sync_buffers));
+		sync_changed(dev);
+		goto out;
+	}
+	if (!dev->consumer_sync || opener->memory != V4L2_MEMORY_DMABUF ||
+	    bind->index >= opener->buffer_count ||
+	    bind->reserved[0] || bind->reserved[1]) {
+		ret = -EINVAL;
+		goto out;
+	}
+	/* Even before sealing, a bound index cannot silently change storage. */
+	if (dev->buffers[bind->index].import_dbuf) {
+		ret = -EBUSY;
+		goto out;
+	}
+	db = dma_buf_get(bind->fd);
+	if (IS_ERR(db)) {
+		ret = PTR_ERR(db);
+		goto out;
+	}
+	if (db->size < dev->buffer_size) {
+		dma_buf_put(db);
+		ret = -EINVAL;
+		goto out;
+	}
+	dev->buffers[bind->index].import_dbuf = db;
+	dev->sync_buffers[bind->index].fd = bind->fd;
+out:
+	mutex_unlock(&dev->image_mutex);
+	return ret;
+}
+
+static void sync_buffer_info(struct v4l2_loopback_device *dev,
+			     struct v4l2_buffer *buf, u32 type, u32 index)
+{
+	struct v4l2l_sync_buffer *slot = &dev->sync_buffers[index];
+
+	*buf = dev->buffers[index].buffer;
+	buf->type = type;
+	buf->flags &= ~(V4L2_BUF_FLAG_QUEUED | V4L2_BUF_FLAG_DONE |
+			V4L2_BUF_FLAG_ERROR);
+	if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT) {
+		buf->memory = V4L2_MEMORY_DMABUF;
+		buf->m.fd = slot->fd;
+		if (slot->state == V4L2L_SYNC_PUBLISHED ||
+		    slot->state == V4L2L_SYNC_DELIVERED)
+			buf->flags |= V4L2_BUF_FLAG_QUEUED;
+		if (slot->state == V4L2L_SYNC_RELEASED ||
+		    slot->state == V4L2L_SYNC_CANCELLED)
+			buf->flags |= V4L2_BUF_FLAG_DONE;
+		if (slot->state == V4L2L_SYNC_CANCELLED ||
+		    slot->state == V4L2L_SYNC_RETIRED)
+			buf->flags |= V4L2_BUF_FLAG_ERROR;
+	} else {
+		buf->memory = V4L2_MEMORY_MMAP;
+		if (slot->capture_queued)
+			buf->flags |= slot->state == V4L2L_SYNC_PUBLISHED ?
+				V4L2_BUF_FLAG_DONE : V4L2_BUF_FLAG_QUEUED;
+	}
+}
+
+static int sync_qbuf(struct file *file, struct v4l2_loopback_opener *opener,
+		     struct v4l2_buffer *buf)
+{
+	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
+	struct v4l2l_sync_buffer *slot;
+	struct v4l2_buffer *frame;
+	struct dma_buf *db;
+	u32 type = buf->type, index = buf->index;
+	int ret = 0;
+
+	mutex_lock(&dev->image_mutex);
+	if ((type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
+	     type != V4L2_BUF_TYPE_VIDEO_OUTPUT) ||
+	    !is_allocated(opener, type, index) || buf->memory != opener->memory) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (dev->producer_stopped) {
+		ret = -EPIPE;
+		goto out;
+	}
+	slot = &dev->sync_buffers[index];
+	frame = &dev->buffers[index].buffer;
+	if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE) {
+		if (slot->capture_queued) {
+			ret = -EINVAL;
+			goto out;
+		}
+		/* Initial QBUF is availability only; DQBUF must precede release. */
+		if (slot->state == V4L2L_SYNC_DELIVERED)
+			slot->state = V4L2L_SYNC_RELEASED;
+		slot->capture_queued = true;
+	} else {
+		if (!sync_bound(dev)) {
+			ret = -ENODATA;
+			goto out;
+		}
+		if (slot->state != V4L2L_SYNC_IDLE) {
+			ret = -EBUSY;
+			goto out;
+		}
+		if (dev->sync_order == U64_MAX) {
+			ret = -EOVERFLOW;
+			goto out;
+		}
+		db = dma_buf_get(buf->m.fd);
+		if (IS_ERR(db)) {
+			ret = PTR_ERR(db);
+			goto out;
+		}
+		ret = db == dev->buffers[index].import_dbuf ? 0 : -EINVAL;
+		dma_buf_put(db);
+		if (ret)
+			goto out;
+		if (buf->bytesused > dev->pix_format.sizeimage) {
+			ret = -EINVAL;
+			goto out;
+		}
+		dev->bindings_sealed = true;
+		slot->fd = buf->m.fd;
+		slot->order = dev->sync_order++;
+		slot->state = V4L2L_SYNC_PUBLISHED;
+		frame->sequence = slot->order;
+		frame->bytesused = buf->bytesused;
+		frame->field = buf->field;
+		frame->flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+		if (buf->timestamp.tv_sec || buf->timestamp.tv_usec) {
+			frame->timestamp = buf->timestamp;
+			frame->flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+		} else {
+			v4l2l_get_timestamp(frame);
+		}
+	}
+	sync_buffer_info(dev, buf, type, index);
+	sync_changed(dev);
+out:
+	mutex_unlock(&dev->image_mutex);
+	return ret;
+}
+
+static int sync_ready(struct v4l2_loopback_device *dev, u32 type)
+{
+	int index = -1;
+	u32 i;
+
+	for (i = 0; i < dev->used_buffer_count; i++) {
+		struct v4l2l_sync_buffer *slot = &dev->sync_buffers[i];
+		bool ready = type == V4L2_BUF_TYPE_VIDEO_CAPTURE ?
+			(slot->state == V4L2L_SYNC_PUBLISHED && slot->capture_queued) :
+			(slot->state == V4L2L_SYNC_RELEASED ||
+			 slot->state == V4L2L_SYNC_CANCELLED);
+
+		if (ready && (index < 0 ||
+			      slot->order < dev->sync_buffers[index].order))
+			index = i;
+	}
+	return index;
+}
+
+static int sync_dqbuf(struct file *file, struct v4l2_loopback_opener *opener,
+		      struct v4l2_buffer *buf)
+{
+	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
+	u32 type = buf->type;
+	unsigned long epoch, change;
+	int ret, index;
+
+	mutex_lock(&dev->image_mutex);
+	epoch = opener->sync_stream_epoch;
+	for (;;) {
+		if ((type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
+		     type != V4L2_BUF_TYPE_VIDEO_OUTPUT) ||
+		    !is_allocated(opener, type, 0) || buf->memory != opener->memory) {
+			ret = -EINVAL;
+			break;
+		}
+		if (!opener->stream_token || dev->producer_stopped ||
+		    epoch != opener->sync_stream_epoch) {
+			ret = -EPIPE;
+			break;
+		}
+		index = sync_ready(dev, type);
+		if (index >= 0) {
+			struct v4l2l_sync_buffer *slot = &dev->sync_buffers[index];
+
+			sync_buffer_info(dev, buf, type, index);
+			buf->flags &= ~(V4L2_BUF_FLAG_DONE | V4L2_BUF_FLAG_QUEUED);
+			if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE) {
+				slot->state = V4L2L_SYNC_DELIVERED;
+				slot->capture_queued = false;
+			} else {
+				slot->state = slot->state == V4L2L_SYNC_CANCELLED ?
+					V4L2L_SYNC_RETIRED : V4L2L_SYNC_IDLE;
+			}
+			ret = 0;
+			break;
+		}
+		if (file->f_flags & O_NONBLOCK) {
+			ret = -EAGAIN;
+			break;
+		}
+		change = dev->sync_change;
+		mutex_unlock(&dev->image_mutex);
+		ret = wait_event_interruptible(dev->read_event,
+				READ_ONCE(dev->sync_change) != change);
+		if (ret)
+			return ret;
+		mutex_lock(&dev->image_mutex);
+	}
+	mutex_unlock(&dev->image_mutex);
+	return ret;
+}
+
+static void sync_stop(struct v4l2_loopback_device *dev,
+		      struct v4l2_loopback_opener *opener, u32 type)
+{
+	u32 i;
+
+	for (i = 0; i < dev->used_buffer_count; i++) {
+		struct v4l2l_sync_buffer *slot = &dev->sync_buffers[i];
+
+		if (slot->state == V4L2L_SYNC_PUBLISHED ||
+		    slot->state == V4L2L_SYNC_DELIVERED)
+			slot->state = V4L2L_SYNC_CANCELLED;
+		slot->capture_queued = false;
+	}
+	if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT)
+		dev->producer_stopped = true;
+	if (opener->stream_token) {
+		release_token(dev, opener, stream);
+		if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE)
+			client_usage_queue_event(dev->vdev);
+	}
+	opener->sync_stream_epoch++;
+	sync_changed(dev);
+}
+
 /* negotiate buffer type
  * only mmap streaming supported
  * called on VIDIOC_REQBUFS
@@ -1715,6 +2040,28 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 	result = mutex_lock_killable(&dev->image_mutex);
 	if (result < 0)
 		return result; /* -EINTR */
+	if (dev->consumer_sync && req_count) {
+		if (opener->buffer_count) {
+			result = -EBUSY;
+			goto exit_reqbufs_unlock;
+		}
+		if (dev->producer_stopped) {
+			result = -EPIPE;
+			goto exit_reqbufs_unlock;
+		}
+		if ((reqbuf->type != V4L2_BUF_TYPE_VIDEO_OUTPUT &&
+		     reqbuf->type != V4L2_BUF_TYPE_VIDEO_CAPTURE) ||
+		    (reqbuf->type == V4L2_BUF_TYPE_VIDEO_OUTPUT &&
+		     reqbuf->memory != V4L2_MEMORY_DMABUF) ||
+		    opener->io_method == V4L2L_IO_TIMEOUT) {
+			result = -EINVAL;
+			goto exit_reqbufs_unlock;
+		}
+		if (reqbuf->type == V4L2_BUF_TYPE_VIDEO_CAPTURE && !sync_bound(dev)) {
+			result = -EAGAIN;
+			goto exit_reqbufs_unlock;
+		}
+	}
 
 	/* CASE queue/dequeue timeout-buffer only: */
 	if (opener->format_token & V4L2L_TOKEN_TIMEOUT) {
@@ -1736,15 +2083,20 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 		 * Release imports here while image_mutex is held. do_streamoff()
 		 * cannot, and this also covers close() via REQBUFS(0).
 		 */
-		if (reqbuf->type == V4L2_BUF_TYPE_VIDEO_OUTPUT)
+		if (!result && reqbuf->type == V4L2_BUF_TYPE_VIDEO_OUTPUT)
 			release_import_dbufs_locked(dev);
 		opener->buffer_count = 0;
 		/* undocumented requirement - REQBUFS with count zero should
 		 * ALSO release lock on logical stream */
 		if (opener->format_token)
 			release_token(dev, opener, format);
-		if (has_no_owners(dev))
+		if (has_no_owners(dev)) {
 			dev->used_buffer_count = 0;
+			dev->consumer_sync = false;
+			dev->bindings_sealed = false;
+			dev->producer_stopped = false;
+			sync_changed(dev);
+		}
 		goto exit_reqbufs_unlock;
 	}
 
@@ -1795,7 +2147,9 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 		break;
 	default:
 		opener->io_method = V4L2L_IO_MMAP;
-		prepare_buffer_queue(dev, req_count);
+		opener->memory = reqbuf->memory;
+		if (!dev->consumer_sync || reqbuf->type == V4L2_BUF_TYPE_VIDEO_OUTPUT)
+			prepare_buffer_queue(dev, req_count);
 		dev->used_buffer_count = opener->buffer_count = req_count;
 	}
 exit_reqbufs_unlock:
@@ -1815,6 +2169,20 @@ static int vidioc_querybuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	struct v4l2_loopback_opener *opener = v4l2l_f_to_opener(file, fh);
 	u32 type = buf->type;
 	u32 index = buf->index;
+
+	if (READ_ONCE(dev->consumer_sync)) {
+		int ret = 0;
+
+		mutex_lock(&dev->image_mutex);
+		if ((type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
+		     type != V4L2_BUF_TYPE_VIDEO_OUTPUT) ||
+		    !is_allocated(opener, type, index))
+			ret = -EINVAL;
+		else
+			sync_buffer_info(dev, buf, type, index);
+		mutex_unlock(&dev->image_mutex);
+		return ret;
+	}
 
 	if ((type != V4L2_BUF_TYPE_VIDEO_CAPTURE) &&
 	    (type != V4L2_BUF_TYPE_VIDEO_OUTPUT))
@@ -1887,6 +2255,9 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	u32 index = buf->index;
 	u32 type = buf->type;
 	u32 memory = buf->memory;
+
+	if (READ_ONCE(dev->consumer_sync))
+		return sync_qbuf(file, opener, buf);
 
 	if (!is_allocated(opener, type, index))
 		return -EINVAL;
@@ -2089,6 +2460,9 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	int index;
 	struct v4l2l_buffer *bufd;
 
+	if (READ_ONCE(dev->consumer_sync))
+		return sync_dqbuf(file, opener, buf);
+
 	if (buf->memory != V4L2_MEMORY_MMAP) {
 		/* Allow the producer to dequeue DMABUF buffers on the OUTPUT
 		 * queue so it can recycle slots after a frame is consumed. */
@@ -2169,6 +2543,32 @@ static int vidioc_streamon(struct file *file, void *fh, enum v4l2_buf_type type)
 	struct v4l2_loopback_opener *opener = v4l2l_f_to_opener(file, fh);
 	u32 token = token_from_type(type);
 
+	if (READ_ONCE(dev->consumer_sync)) {
+		int ret = 0;
+
+		mutex_lock(&dev->image_mutex);
+		if ((type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
+		     type != V4L2_BUF_TYPE_VIDEO_OUTPUT) ||
+		    !is_allocated(opener, type, 0)) {
+			ret = -EINVAL;
+		} else if (dev->producer_stopped) {
+			ret = -EPIPE;
+		} else if (!sync_bound(dev)) {
+			ret = -ENODATA;
+		} else if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE &&
+			   has_output_token(dev->stream_tokens)) {
+			ret = -EIO;
+		} else if (!opener->stream_token) {
+			dev->bindings_sealed = true;
+			acquire_token(dev, opener, stream, token);
+			if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE)
+				client_usage_queue_event(dev->vdev);
+			sync_changed(dev);
+		}
+		mutex_unlock(&dev->image_mutex);
+		return ret;
+	}
+
 	/* short-circuit when using timeout buffer set */
 	if (opener->format_token & V4L2L_TOKEN_TIMEOUT)
 		return 0;
@@ -2214,6 +2614,13 @@ static int do_streamoff(struct file *file, void *fh, enum v4l2_buf_type type)
 		return -EBUSY;
 	if (opener->format_token & ~token)
 		return -EINVAL;
+	if (dev->consumer_sync) {
+		if (type != V4L2_BUF_TYPE_VIDEO_OUTPUT &&
+		    type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+			return -EINVAL;
+		sync_stop(dev, opener, type);
+		return 0;
+	}
 
 	switch (type) {
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
@@ -2243,13 +2650,14 @@ static int vidioc_streamoff(struct file *file, void *fh,
 			    enum v4l2_buf_type type)
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
-	int ret = do_streamoff(file, fh, type);
+	int ret;
 
-	if (!ret && type == V4L2_BUF_TYPE_VIDEO_OUTPUT) {
-		mutex_lock(&dev->image_mutex);
+	mutex_lock(&dev->image_mutex);
+	ret = do_streamoff(file, fh, type);
+	/* Stable sync bindings survive STREAMOFF until OUTPUT REQBUFS(0). */
+	if (!ret && type == V4L2_BUF_TYPE_VIDEO_OUTPUT && !dev->consumer_sync)
 		release_import_dbufs_locked(dev);
-		mutex_unlock(&dev->image_mutex);
-	}
+	mutex_unlock(&dev->image_mutex);
 	return ret;
 }
 
@@ -2513,6 +2921,12 @@ static int vidioc_expbuf(struct file *file, void *fh,
 		ret = -EINVAL;
 		goto unlock;
 	}
+	if (dev->consumer_sync &&
+	    (!is_allocated(opener, eb->type, eb->index) ||
+	     !dev->buffers[eb->index].import_dbuf)) {
+		ret = -ENODATA;
+		goto unlock;
+	}
 	/*
 	 * If the slot was filled by DMABUF import, hand the consumer that
 	 * same dma-buf (a fresh fd) instead of wrapping dev->image, so the
@@ -2591,6 +3005,11 @@ static int v4l2_loopback_mmap(struct file *file, struct vm_area_struct *vma)
 	result = mutex_lock_killable(&dev->image_mutex);
 	if (result < 0)
 		return result;
+	if (dev->consumer_sync) {
+		/* MMAP selects queue ownership; map the exported dma-buf fd. */
+		result = -EOPNOTSUPP;
+		goto exit_mmap_unlock;
+	}
 
 	if (size > dev->buffer_size) {
 		dprintk("mmap() attempt to map %lubytes when %ubytes are "
@@ -2667,6 +3086,19 @@ static unsigned int v4l2_loopback_poll(struct file *file,
 			if (!(req_events & DEFAULT_POLLMASK))
 				return ret_mask;
 		}
+	}
+	if (READ_ONCE(dev->consumer_sync)) {
+		u32 type = opener->format_token == V4L2L_TOKEN_OUTPUT ?
+			V4L2_BUF_TYPE_VIDEO_OUTPUT : V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+		mutex_lock(&dev->image_mutex);
+		if (dev->producer_stopped || !opener->stream_token)
+			ret_mask |= POLLERR;
+		else if (sync_ready(dev, type) >= 0)
+			ret_mask |= type == V4L2_BUF_TYPE_VIDEO_OUTPUT ?
+				(POLLOUT | POLLWRNORM) : (POLLIN | POLLRDNORM);
+		mutex_unlock(&dev->image_mutex);
+		return ret_mask;
 	}
 
 	switch (opener->format_token) {
@@ -2780,6 +3212,9 @@ static int start_fileio(struct file *file, void *fh, enum v4l2_buf_type type)
 					      .type = type };
 	int token = token_from_type(type);
 	int result;
+
+	if (READ_ONCE(dev->consumer_sync))
+		return -EOPNOTSUPP;
 
 	if (opener->format_token & V4L2L_TOKEN_TIMEOUT ||
 	    opener->format_token & ~token)
@@ -3062,6 +3497,8 @@ static void init_capture_param(struct v4l2_captureparm *capture_param)
 
 static void check_timers(struct v4l2_loopback_device *dev)
 {
+	if (READ_ONCE(dev->consumer_sync))
+		return;
 	if (has_output_token(dev->stream_tokens))
 		return;
 
@@ -3532,6 +3969,7 @@ static const struct v4l2_file_operations v4l2_loopback_fops = {
 
 static const struct v4l2_ioctl_ops v4l2_loopback_ioctl_ops = {
 	// clang-format off
+	.vidioc_default			= &vidioc_default,
 	.vidioc_querycap		= &vidioc_querycap,
 	.vidioc_enum_framesizes		= &vidioc_enum_framesizes,
 	.vidioc_enum_frameintervals	= &vidioc_enum_frameintervals,
