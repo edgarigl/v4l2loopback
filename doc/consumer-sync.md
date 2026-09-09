@@ -15,7 +15,9 @@ upstream V4L2 ABI. Only the producer needs the two private setup ioctls from
 On a node without a CAPTURE owner:
 
 1. Open the OUTPUT fd and set its single-planar format with S_FMT.
-2. Pass `__u32 enable = 1` to `V4L2LOOPBACK_SET_CONSUMER_SYNC`.
+2. Pass `__u32 mode = V4L2LOOPBACK_CONSUMER_SYNC_TRY` to
+   `V4L2LOOPBACK_SET_CONSUMER_SYNC`. This lets a persistent producer skip
+   readers that have not connected or cannot accept that slot.
 3. Request the full pool with OUTPUT REQBUFS(DMABUF).
 4. For every slot, call `V4L2LOOPBACK_BIND_DMABUF` with its index and fd.
    Both reserved words must be zero. Each dma-buf must cover QUERYBUF's
@@ -66,6 +68,15 @@ published frame and availability, and removes availability. The later QBUF
 releases that frame and restores availability for the next one.
 
 - OUTPUT QBUF on a non-IDLE slot returns EBUSY.
+- With `V4L2LOOPBACK_CONSUMER_SYNC_TRY` (2), OUTPUT QBUF returns EAGAIN
+  without publishing unless CAPTURE is streaming and that index is queued
+  as available. The availability check and publication are atomic with
+  respect to CAPTURE stop/close. A late reader receives fresh frames instead
+  of occupying its producer's credits with stale startup frames.
+- `V4L2LOOPBACK_CONSUMER_SYNC_WAIT` (1) allows publication before a reader
+  queues the index or starts streaming. The pending publication waits for
+  a reader; the OUTPUT QBUF ioctl itself does not wait. OFF (0) disables
+  consumer synchronization. Select the mode before requesting buffers.
 - CAPTURE QBUF on an already queued slot returns EINVAL. In particular, a
   repeated release cannot complete a newly published frame before its DQBUF.
 - CAPTURE DQBUF delivers published frames in publication order among
@@ -127,3 +138,5 @@ exclusive CAPTURE ownership, initial availability, exact queue-state release,
 duplicate QBUF, 1,000 reuses, blocking/nonblocking/poll, signal interruption,
 both STREAMOFF directions, close cancellation, retirement across reconnects,
 export lifetime and legacy write/read/DMABUF compatibility.
+TRY-mode checks also cover absent, queued-but-not-streaming, unavailable,
+stopped and closed readers, with no publication on EAGAIN.

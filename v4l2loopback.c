@@ -404,6 +404,7 @@ struct v4l2_loopback_device {
 
 	/* Consumer-coupled queues and bindings, protected by image_mutex. */
 	bool consumer_sync;
+	bool consumer_sync_try;
 	bool bindings_sealed;
 	bool producer_stopped;
 	unsigned long sync_change;
@@ -1729,7 +1730,7 @@ static long vidioc_default(struct file *file, void *fh, bool valid_prio,
 	if (cmd == V4L2LOOPBACK_SET_CONSUMER_SYNC) {
 		u32 enable = *(__u32 *)arg;
 
-		if (enable > 1) {
+		if (enable > V4L2LOOPBACK_CONSUMER_SYNC_TRY) {
 			ret = -EINVAL;
 			goto out;
 		}
@@ -1741,6 +1742,7 @@ static long vidioc_default(struct file *file, void *fh, bool valid_prio,
 			goto out;
 		}
 		dev->consumer_sync = enable;
+		dev->consumer_sync_try = enable == V4L2LOOPBACK_CONSUMER_SYNC_TRY;
 		dev->producer_stopped = false;
 		dev->sync_order = 0;
 		memset(dev->sync_buffers, 0, sizeof(dev->sync_buffers));
@@ -1843,6 +1845,11 @@ static int sync_qbuf(struct file *file, struct v4l2_loopback_opener *opener,
 		}
 		if (slot->state != V4L2L_SYNC_IDLE) {
 			ret = -EBUSY;
+			goto out;
+		}
+		if (dev->consumer_sync_try &&
+		    (has_capture_token(dev->stream_tokens) || !slot->capture_queued)) {
+			ret = -EAGAIN;
 			goto out;
 		}
 		if (dev->sync_order == U64_MAX) {

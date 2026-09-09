@@ -106,12 +106,19 @@ struct v4l2_loopback_config {
 	_IOWR(V4L2LOOPBACK_CTL_IOCTLMAGIC, 3, struct v4l2_loopback_config)
 
 /* Experimental /dev/videoN producer interface; see doc/consumer-sync.md.
- * SET_CONSUMER_SYNC takes 0 or 1 after OUTPUT S_FMT, before REQBUFS.
+ * SET_CONSUMER_SYNC takes a mode after OUTPUT S_FMT, before REQBUFS.
  * BIND_DMABUF fixes an index to one allocation without publishing a frame.
  * CAPTURE clients continue to use standard MMAP queue ioctls and EXPBUF.
  */
 #define V4L2LOOPBACK_SET_CONSUMER_SYNC \
 	_IOW('V', BASE_VIDIOC_PRIVATE, __u32)
+
+#define V4L2LOOPBACK_CONSUMER_SYNC_OFF 0
+#define V4L2LOOPBACK_CONSUMER_SYNC_WAIT 1
+/* OUTPUT QBUF returns EAGAIN unless CAPTURE is streaming with this index
+ * queued. Rejection publishes nothing and consumes no producer credit.
+ */
+#define V4L2LOOPBACK_CONSUMER_SYNC_TRY 2
 
 struct v4l2loopback_bind_dmabuf {
 	__u32 index;
