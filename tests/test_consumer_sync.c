@@ -160,6 +160,48 @@ static void legacy_file_io(const char *path)
 	puts("ok - legacy write/read works after the sync pool closes");
 }
 
+static void try_mode(const char *path, int *fds)
+{
+	unsigned out = V4L2_BUF_TYPE_VIDEO_OUTPUT, cap = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	uint32_t mode = V4L2LOOPBACK_CONSUMER_SYNC_TRY;
+	struct v4l2_format fmt = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
+	struct v4l2_buffer b;
+	int w = open(path, O_RDWR | O_NONBLOCK), r;
+
+	CHECK(w >= 0);
+	fmt.fmt.pix.width = 320;
+	fmt.fmt.pix.height = 240;
+	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+	CHECK(ioctl(w, VIDIOC_S_FMT, &fmt) == 0);
+	CHECK(ioctl(w, V4L2LOOPBACK_SET_CONSUMER_SYNC, &mode) == 0);
+	request(w, out, COUNT);
+	for (unsigned i = 0; i < COUNT; i++) {
+		struct v4l2loopback_bind_dmabuf bind = { .index = i, .fd = fds[i] };
+		CHECK(ioctl(w, V4L2LOOPBACK_BIND_DMABUF, &bind) == 0);
+	}
+	CHECK(ioctl(w, VIDIOC_STREAMON, &out) == 0);
+	ERROR(queue(w, out, 0, fds[0]), EAGAIN);
+	ERROR(dequeue(w, out, &b), EAGAIN);
+	r = open(path, O_RDWR | O_NONBLOCK);
+	CHECK(r >= 0);
+	request(r, cap, COUNT);
+	CHECK(queue(r, cap, 0, -1) == 0);
+	ERROR(queue(w, out, 0, fds[0]), EAGAIN);
+	CHECK(ioctl(r, VIDIOC_STREAMON, &cap) == 0);
+	ERROR(dequeue(r, cap, &b), EAGAIN);
+	ERROR(queue(w, out, 1, fds[1]), EAGAIN);
+	CHECK(queue(w, out, 0, fds[0]) == 0);
+	CHECK(dequeue(r, cap, &b) == 0 && b.index == 0 && b.sequence == 0);
+	CHECK(queue(r, cap, 0, -1) == 0);
+	CHECK(dequeue(w, out, &b) == 0 && !(b.flags & V4L2_BUF_FLAG_ERROR));
+	CHECK(ioctl(r, VIDIOC_STREAMOFF, &cap) == 0);
+	ERROR(queue(w, out, 0, fds[0]), EAGAIN);
+	close(r);
+	ERROR(queue(w, out, 0, fds[0]), EAGAIN);
+	close(w);
+	puts("ok - TRY mode skips absent/stopped/unavailable readers without publication");
+}
+
 int main(int argc, char **argv)
 {
 	unsigned out = V4L2_BUF_TYPE_VIDEO_OUTPUT;
@@ -355,6 +397,7 @@ int main(int argc, char **argv)
 	ERROR(queue(w, out, 0, fds[0]), EPIPE);
 	close(w);
 	close(r);
+	try_mode(argv[1], fds);
 	for (unsigned i = 0; i < COUNT; i++) {
 		void *map = mmap(NULL, length, PROT_READ, MAP_SHARED, exports[i], 0);
 		CHECK(map != MAP_FAILED);
