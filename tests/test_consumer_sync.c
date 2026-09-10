@@ -2,6 +2,7 @@
 /* Run on an unused loopback: test_consumer_sync /dev/video10 [dma-heap]. */
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/dma-buf.h>
 #include <linux/dma-heap.h>
 #include <linux/videodev2.h>
 #include <poll.h>
@@ -212,6 +213,7 @@ int main(int argc, char **argv)
 	struct v4l2_exportbuffer eb = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
 	uint32_t enable = 1;
 	int w, r, heap, fds[COUNT], exports[COUNT], p[2];
+	void *maps[COUNT];
 	size_t length;
 	pid_t child;
 
@@ -293,9 +295,43 @@ int main(int argc, char **argv)
 	for (unsigned i = 0; i < COUNT; i++) {
 		exports[i] = export(r, cap, i);
 		same_object(fds[i], exports[i]);
+		b = buffer(cap, i);
+		CHECK(ioctl(r, VIDIOC_QUERYBUF, &b) == 0);
+		maps[i] = mmap(NULL, b.length, PROT_READ, MAP_SHARED, r, b.m.offset);
+		CHECK(maps[i] != MAP_FAILED);
 	}
-	CHECK(mmap(NULL, length, PROT_READ, MAP_SHARED, r, 0) == MAP_FAILED);
-	CHECK(errno == EOPNOTSUPP);
+	CHECK(mmap(NULL, length * 2, PROT_READ, MAP_SHARED, r, 0) == MAP_FAILED);
+	CHECK(errno == EINVAL);
+	CHECK(mmap(NULL, length, PROT_READ, MAP_SHARED, r, length * COUNT) == MAP_FAILED);
+	CHECK(errno == EINVAL);
+	CHECK(mmap(NULL, length, PROT_READ, MAP_SHARED, w, 0) == MAP_FAILED);
+	CHECK(errno == EINVAL);
+	CHECK(mmap(NULL, length, PROT_READ, MAP_SHARED, r, sysconf(_SC_PAGESIZE)) == MAP_FAILED);
+	CHECK(errno == EINVAL);
+	{
+		int unowned = open(argv[1], O_RDWR | O_NONBLOCK);
+		CHECK(unowned >= 0);
+		CHECK(mmap(NULL, length, PROT_READ, MAP_SHARED, unowned, 0) == MAP_FAILED);
+		CHECK(errno == EINVAL);
+		close(unowned);
+	}
+	/* Slot 1 is still free. Check the mapping aliases the producer's pages. */
+	{
+		struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE };
+		unsigned char *map = mmap(NULL, length, PROT_READ | PROT_WRITE,
+					 MAP_SHARED, fds[1], 0);
+		CHECK(map != MAP_FAILED);
+		CHECK(ioctl(fds[1], DMA_BUF_IOCTL_SYNC, &sync) == 0);
+		map[0] = 0x5a;
+		sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
+		CHECK(ioctl(fds[1], DMA_BUF_IOCTL_SYNC, &sync) == 0);
+		sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+		CHECK(ioctl(exports[1], DMA_BUF_IOCTL_SYNC, &sync) == 0);
+		CHECK(((unsigned char *)maps[1])[0] == 0x5a);
+		sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+		CHECK(ioctl(exports[1], DMA_BUF_IOCTL_SYNC, &sync) == 0);
+		CHECK(munmap(map, length) == 0);
+	}
 	ERROR(ioctl(w, V4L2LOOPBACK_BIND_DMABUF, &bind), EBUSY);
 	CHECK(queue(r, cap, 0, -1) == 0);
 	CHECK(ioctl(r, VIDIOC_STREAMON, &cap) == 0);
@@ -406,6 +442,10 @@ int main(int argc, char **argv)
 		close(exports[i]);
 		close(fds[i]);
 	}
+	CHECK(((unsigned char *)maps[1])[0] == 0x5a);
+	for (unsigned i = 0; i < COUNT; i++)
+		CHECK(munmap(maps[i], length) == 0);
+	puts("ok - video mmap aliases imported storage and survives all fd closes");
 	puts("ok - blocking wakeup, EINTR, 1000 reuses, close and producer stop");
 	legacy_file_io(argv[1]);
 	puts("PASS consumer-coupled queues");

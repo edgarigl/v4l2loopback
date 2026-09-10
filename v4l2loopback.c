@@ -3013,9 +3013,33 @@ static int v4l2_loopback_mmap(struct file *file, struct vm_area_struct *vma)
 	if (result < 0)
 		return result;
 	if (dev->consumer_sync) {
-		/* MMAP selects queue ownership; map the exported dma-buf fd. */
-		result = -EOPNOTSUPP;
-		goto exit_mmap_unlock;
+		struct dma_buf *dbuf;
+		u32 index;
+
+		if (!dev->buffer_size || size > dev->buffer_size ||
+		    (offset >> PAGE_SHIFT) != vma->vm_pgoff ||
+		    offset % dev->buffer_size || offset >= dev->image_size) {
+			result = -EINVAL;
+			goto exit_mmap_unlock;
+		}
+		index = offset / dev->buffer_size;
+		if (!is_allocated(opener, V4L2_BUF_TYPE_VIDEO_CAPTURE, index)) {
+			result = -EINVAL;
+			goto exit_mmap_unlock;
+		}
+		dbuf = dev->buffers[index].import_dbuf;
+		if (!dbuf) {
+			result = -ENODATA;
+			goto exit_mmap_unlock;
+		}
+		/* Stable bindings also serve mmap-only capture clients. The
+		 * exporter supplies the VMA operations and retains its storage.
+		 */
+		get_dma_buf(dbuf);
+		mutex_unlock(&dev->image_mutex);
+		result = dma_buf_mmap(dbuf, vma, 0);
+		dma_buf_put(dbuf);
+		return result;
 	}
 
 	if (size > dev->buffer_size) {
