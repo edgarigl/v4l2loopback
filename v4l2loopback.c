@@ -1718,9 +1718,17 @@ static long vidioc_default(struct file *file, void *fh, bool valid_prio,
 	int ret = 0;
 
 	if (cmd != V4L2LOOPBACK_SET_CONSUMER_SYNC &&
-	    cmd != V4L2LOOPBACK_BIND_DMABUF)
+	    cmd != V4L2LOOPBACK_BIND_DMABUF &&
+	    cmd != V4L2LOOPBACK_GET_CONSUMER_SYNC)
 		return -ENOTTY;
 	mutex_lock(&dev->image_mutex);
+	if (cmd == V4L2LOOPBACK_GET_CONSUMER_SYNC) {
+		*(__u32 *)arg = !dev->consumer_sync ?
+			V4L2LOOPBACK_CONSUMER_SYNC_OFF :
+			(dev->consumer_sync_try ? V4L2LOOPBACK_CONSUMER_SYNC_TRY :
+			 V4L2LOOPBACK_CONSUMER_SYNC_WAIT);
+		goto out;
+	}
 	if (opener->format_token != V4L2L_TOKEN_OUTPUT ||
 	    !(dev->format_tokens & V4L2L_TOKEN_CAPTURE) ||
 	    opener->stream_token || dev->bindings_sealed) {

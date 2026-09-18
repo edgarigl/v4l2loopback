@@ -7,8 +7,15 @@ MMAP/write and DMABUF injection behavior is unchanged.
 
 The interface is experimental and extends the DMABUF work in
 [PR #665](https://github.com/v4l2loopback/v4l2loopback/pull/665). It is not an
-upstream V4L2 ABI. Only the producer needs the two private setup ioctls from
+upstream V4L2 ABI. The producer uses the two private setup ioctls from
 `v4l2loopback.h`; consumers use standard V4L2 queue operations and EXPBUF.
+
+A forwarding CAPTURE client can query `V4L2LOOPBACK_GET_CONSUMER_SYNC`
+(`__u32`) to distinguish OFF, WAIT, and TRY. This read-only query works on
+both endpoints. Hold CAPTURE REQBUFS ownership before relying on the answer;
+an earlier answer is only a snapshot. Forwarders must reject OFF and older
+modules without the query, because EXPBUF alone does not ensure delayed reuse.
+The query does not establish CPU/GPU access protection or GPU completion.
 
 ## Setup and stable storage
 

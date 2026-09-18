@@ -129,4 +129,11 @@ struct v4l2loopback_bind_dmabuf {
 #define V4L2LOOPBACK_BIND_DMABUF \
 	_IOW('V', BASE_VIDIOC_PRIVATE + 1, struct v4l2loopback_bind_dmabuf)
 
+/* Read-only query available to either endpoint. Snapshot only: CAPTURE
+ * REQBUFS must hold the pool while relying on the returned release contract.
+ * Returns OFF, WAIT or TRY, including after producer STREAMOFF.
+ */
+#define V4L2LOOPBACK_GET_CONSUMER_SYNC \
+	_IOR('V', BASE_VIDIOC_PRIVATE + 2, __u32)
+
 #endif /* _V4L2LOOPBACK_H */

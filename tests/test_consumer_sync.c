@@ -70,6 +70,10 @@ static void request(int fd, unsigned type, unsigned count)
 
 static int export(int fd, unsigned type, unsigned index)
 {
+	uint32_t mode;
+	CHECK(ioctl(fd, V4L2LOOPBACK_GET_CONSUMER_SYNC, &mode) == 0);
+	CHECK(mode == V4L2LOOPBACK_CONSUMER_SYNC_WAIT ||
+	      mode == V4L2LOOPBACK_CONSUMER_SYNC_TRY);
 	struct v4l2_exportbuffer e = { .type = type, .index = index,
 		.flags = O_CLOEXEC | O_RDWR };
 	CHECK(ioctl(fd, VIDIOC_EXPBUF, &e) == 0);
@@ -175,6 +179,9 @@ static void try_mode(const char *path, int *fds)
 	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
 	CHECK(ioctl(w, VIDIOC_S_FMT, &fmt) == 0);
 	CHECK(ioctl(w, V4L2LOOPBACK_SET_CONSUMER_SYNC, &mode) == 0);
+	mode = 0;
+	CHECK(ioctl(w, V4L2LOOPBACK_GET_CONSUMER_SYNC, &mode) == 0);
+	CHECK(mode == V4L2LOOPBACK_CONSUMER_SYNC_TRY);
 	request(w, out, COUNT);
 	for (unsigned i = 0; i < COUNT; i++) {
 		struct v4l2loopback_bind_dmabuf bind = { .index = i, .fd = fds[i] };
@@ -228,7 +235,17 @@ int main(int argc, char **argv)
 	fmt.fmt.pix.height = 240;
 	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
 	CHECK(ioctl(w, VIDIOC_S_FMT, &fmt) == 0);
+	{
+		uint32_t mode = 99;
+		CHECK(ioctl(w, V4L2LOOPBACK_GET_CONSUMER_SYNC, &mode) == 0);
+		CHECK(mode == V4L2LOOPBACK_CONSUMER_SYNC_OFF);
+	}
 	CHECK(ioctl(w, V4L2LOOPBACK_SET_CONSUMER_SYNC, &enable) == 0);
+	{
+		uint32_t mode = 0;
+		CHECK(ioctl(w, V4L2LOOPBACK_GET_CONSUMER_SYNC, &mode) == 0);
+		CHECK(mode == V4L2LOOPBACK_CONSUMER_SYNC_WAIT);
+	}
 	{
 		struct v4l2_requestbuffers req = { .type = out,
 			.memory = V4L2_MEMORY_MMAP, .count = COUNT };
